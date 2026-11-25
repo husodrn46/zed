@@ -189,6 +189,9 @@ impl StagedDiff {
                     editor.set_diff_hunk_renderer(Some(Arc::new(StagedDiffHunkRenderer)), cx);
                     editor.rhs_editor().update(cx, |rhs_editor, _cx| {
                         rhs_editor.set_read_only(true);
+                        // The excerpts show the index text; opening one goes to the
+                        // worktree file instead (see `DiffMultibuffer`).
+                        rhs_editor.set_delegate_open_excerpts(true);
                         rhs_editor.register_addon(GitPanelAddon {
                             workspace: workspace_handle,
                         });
@@ -814,6 +817,109 @@ mod tests {
             );
             assert_eq!(active_item.tab_content_text(0, cx), "Staged Changes");
             assert!(!active_item.can_save(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_file_from_staged_view_opens_the_editable_worktree_file(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let committed_contents = r#"
+            fn main() {
+                println!("hello world");
+            }
+        "#
+        .unindent();
+        let staged_contents = r#"
+            fn main() {
+                println!("goodbye world");
+            }
+        "#
+        .unindent();
+        // An unstaged line on top: the staged line is row 1 in the index and row 2 on disk.
+        let file_contents = r#"
+            // print goodbye
+            fn main() {
+                println!("goodbye world");
+            }
+        "#
+        .unindent();
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "main.rs": file_contents,
+                }
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("src/main.rs", committed_contents)],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("src/main.rs", staged_contents)],
+        );
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            StagedDiff::deploy_at(workspace, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let rhs_editor = workspace.update(cx, |workspace, cx| {
+            let staged_diff = workspace.active_item_as::<StagedDiff>(cx).unwrap();
+            let diff = staged_diff.read(cx).diff.read(cx);
+            diff.editor().read(cx).rhs_editor().clone()
+        });
+
+        // Put the cursor on the staged line and run "Open File".
+        rhs_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = snapshot.text().find("goodbye world").unwrap();
+            let offset = multi_buffer::MultiBufferOffset(offset);
+            editor.change_selections(
+                editor::SelectionEffects::no_scroll(),
+                window,
+                cx,
+                |selections| selections.select_ranges([offset..offset]),
+            );
+            editor.open_excerpts(&editor::actions::OpenExcerpts, window, cx);
+        });
+        cx.run_until_parked();
+
+        let opened = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap()
+        });
+        opened.update(cx, |editor, cx| {
+            assert!(!editor.read_only(cx), "the worktree file must be editable");
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap();
+            let buffer = buffer.read(cx);
+            assert!(
+                project::File::from_dyn(buffer.file()).is_some(),
+                "the worktree file must open, not the index text"
+            );
+            assert!(buffer.text().starts_with("// print goodbye"));
+            let cursor = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(
+                cursor.row, 2,
+                "the cursor must land on the same line on disk"
+            );
         });
     }
 

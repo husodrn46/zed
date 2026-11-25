@@ -7,7 +7,7 @@ use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
+    Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
     multibuffer_context_lines, scroll::Autoscroll,
 };
 use futures::{FutureExt as _, StreamExt as _, stream};
@@ -18,7 +18,7 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::{BufferOffset, MultiBuffer, PathKey};
 use project::{
     ConflictSet, Project, ProjectPath,
     git_store::{
@@ -27,7 +27,7 @@ use project::{
     },
 };
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
@@ -44,6 +44,9 @@ const MAX_CONCURRENT_BUFFER_LOADS: usize = 16;
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
     display_buffer: Entity<Buffer>,
+    /// The worktree buffer of the file. It differs from `display_buffer` when the
+    /// view shows another text of the file, like the index in the staged view.
+    main_buffer: Entity<Buffer>,
     _diff_subscription: Subscription,
     _conflict_set: Option<Entity<ConflictSet>>,
     _conflict_set_subscription: Option<Subscription>,
@@ -425,6 +428,12 @@ impl DiffMultibuffer {
                 self._task =
                     cx.spawn_in(window, async move |this, cx| Self::refresh(this, cx).await);
             }
+            EditorEvent::OpenExcerptsRequested {
+                selections_by_buffer,
+                split,
+            } => {
+                self.open_excerpts_in_worktree(selections_by_buffer.clone(), *split, window, cx);
+            }
 
             _ => {}
         }
@@ -433,6 +442,85 @@ impl DiffMultibuffer {
         {
             self.focus_handle.focus(window, cx)
         }
+    }
+
+    /// Opens the files behind the requested excerpts. A view that shows another text
+    /// of a file (the index, in the staged view) opens the worktree file instead, at
+    /// the matching position, so that "Open File" gives an editable buffer.
+    fn open_excerpts_in_worktree(
+        &mut self,
+        selections_by_buffer: HashMap<BufferId, (Vec<Range<BufferOffset>>, Option<u32>)>,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let mut direct = HashMap::default();
+        let mut redirected = Vec::new();
+        for (buffer_id, (ranges, scroll_offset)) in selections_by_buffer {
+            let Some(buffer) = self.multibuffer.read(cx).buffer(buffer_id) else {
+                continue;
+            };
+            let main_buffer = self
+                .buffer_subscriptions
+                .values()
+                .find(|entry| entry.display_buffer == buffer)
+                .map(|entry| entry.main_buffer.clone());
+            match main_buffer {
+                Some(main_buffer) if main_buffer != buffer => {
+                    redirected.push((buffer, main_buffer, ranges, scroll_offset));
+                }
+                _ => {
+                    direct.insert(buffer, (ranges, scroll_offset));
+                }
+            }
+        }
+
+        if !direct.is_empty() {
+            Editor::open_buffers_in_workspace(self.workspace.clone(), direct, split, window, cx);
+        }
+        if redirected.is_empty() {
+            return;
+        }
+
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let mut translated = HashMap::default();
+            for (display_buffer, main_buffer, ranges, scroll_offset) in redirected {
+                // Index and worktree text differ by the unstaged changes, so positions
+                // are mapped through the unstaged diff (index -> worktree).
+                let unstaged_diff = git_store
+                    .update(cx, |git_store, cx| {
+                        git_store.open_unstaged_diff(main_buffer.clone(), cx)
+                    })
+                    .await?;
+                let ranges = cx.update(|_, cx| {
+                    let display = display_buffer.read(cx).snapshot();
+                    let main = main_buffer.read(cx).snapshot();
+                    let diff = unstaged_diff.read(cx).snapshot(cx);
+                    let to_main = |offset: BufferOffset| {
+                        let point = display.offset_to_point(offset.0);
+                        let point = diff.base_text_point_to_buffer_point(point, &main);
+                        // The diff may lag behind a buffer that just changed.
+                        let point = main.clip_point(point, language::Bias::Left);
+                        BufferOffset(main.point_to_offset(point))
+                    };
+                    ranges
+                        .into_iter()
+                        .map(|range| to_main(range.start)..to_main(range.end))
+                        .collect::<Vec<_>>()
+                })?;
+                translated.insert(main_buffer, (ranges, scroll_offset));
+            }
+            cx.update(|window, cx| {
+                Editor::open_buffers_in_workspace(workspace, translated, split, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     #[instrument(skip_all)]
@@ -500,6 +588,7 @@ impl DiffMultibuffer {
             BufferSubscriptions {
                 _diff: diff.clone(),
                 display_buffer: display_buffer.clone(),
+                main_buffer,
                 _diff_subscription: diff_subscription,
                 _conflict_set: conflict_set.clone(),
                 _conflict_set_subscription: conflict_set_subscription,
