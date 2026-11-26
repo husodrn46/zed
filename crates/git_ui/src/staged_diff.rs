@@ -924,6 +924,94 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_open_file_from_the_head_side_of_the_split_staged_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Split);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "src": {
+                    "main.rs": "// print goodbye\nfn main() {\n    println!(\"goodbye world\");\n}\n",
+                }
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[(
+                "src/main.rs",
+                "fn main() {\n    println!(\"hello world\");\n}\n".to_string(),
+            )],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[(
+                "src/main.rs",
+                "fn main() {\n    println!(\"goodbye world\");\n}\n".to_string(),
+            )],
+        );
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            StagedDiff::deploy_at(workspace, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let lhs_editor = workspace.update(cx, |workspace, cx| {
+            let staged_diff = workspace.active_item_as::<StagedDiff>(cx).unwrap();
+            let diff = staged_diff.read(cx).diff.read(cx);
+            diff.editor().read(cx).lhs_editor().unwrap().clone()
+        });
+
+        // "Open File" on the HEAD side of the staged line.
+        lhs_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = snapshot.text().find("hello world").unwrap();
+            let offset = multi_buffer::MultiBufferOffset(offset);
+            editor.change_selections(
+                editor::SelectionEffects::no_scroll(),
+                window,
+                cx,
+                |selections| selections.select_ranges([offset..offset]),
+            );
+            editor.open_excerpts(&editor::actions::OpenExcerpts, window, cx);
+        });
+        cx.run_until_parked();
+
+        let opened = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<Editor>(cx).unwrap()
+        });
+        opened.update(cx, |editor, cx| {
+            assert!(!editor.read_only(cx), "the worktree file must be editable");
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap();
+            assert!(project::File::from_dyn(buffer.read(cx).file()).is_some());
+            let cursor = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            assert_eq!(
+                cursor.row, 2,
+                "the cursor must land on the same line on disk"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_toggle_staged_unstages_from_staged_view(cx: &mut TestAppContext) {
         init_test(cx);
 

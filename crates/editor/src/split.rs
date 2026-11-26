@@ -807,11 +807,25 @@ impl SplittableEditor {
                         let translated =
                             translate_lhs_selections_to_rhs(selections_by_buffer, this, cx);
                         if !translated.is_empty() {
-                            let workspace = this.workspace.clone();
                             let split = *split;
-                            Editor::open_buffers_in_workspace(
-                                workspace, translated, split, window, cx,
-                            );
+                            if this.rhs_editor.read(cx).delegate_open_excerpts {
+                                // The right side's owner decides how its buffers open
+                                // (the staged view opens the worktree file instead), so
+                                // hand the translated request to it as the right side would.
+                                let selections_by_buffer = translated
+                                    .into_iter()
+                                    .map(|(buffer, value)| (buffer.read(cx).remote_id(), value))
+                                    .collect();
+                                cx.emit(EditorEvent::OpenExcerptsRequested {
+                                    selections_by_buffer,
+                                    split,
+                                });
+                            } else {
+                                let workspace = this.workspace.clone();
+                                Editor::open_buffers_in_workspace(
+                                    workspace, translated, split, window, cx,
+                                );
+                            }
                         }
                     }
                 }
